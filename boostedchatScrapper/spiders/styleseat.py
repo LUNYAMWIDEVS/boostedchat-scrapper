@@ -9,7 +9,7 @@ from scrapy.spiders import CrawlSpider, Rule
 from scrapy.http import HtmlResponse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from selenium.webdriver.common.by import By
-from boostedchatScrapper.items import StyleSeatItem
+from boostedchatScrapper.items import StyleSeatItem, APIItem
 from urllib.parse import urlparse, parse_qs
 from .helpers.styleseat_dynamic_actions import generate_styleseat_links
 from .helpers.utils import click_element,generate_html
@@ -20,7 +20,7 @@ CLEAN_STRING = re.compile(r"[\']")
 class StyleseatSpider(CrawlSpider):
     name = "styleseat"
     allowed_domains = ["www.styleseat.com"]
-    base_url = "https://www.styleseat.com"
+    base_url = "https://www.styleseat.com/m/"
     start_urls = [
         "https://www.styleseat.com/m/v/gerard",
         "https://www.styleseat.com/m/v/barberpaul",
@@ -29,46 +29,36 @@ class StyleseatSpider(CrawlSpider):
 
     rules = (Rule(LinkExtractor(allow=r"Items/"), callback="parse", follow=True),)
 
+    def __init__(self, region, category, **kwargs):
+        self.region = region # py36
+        self.category = category
+        super().__init__(**kwargs)  # python3
+    
     def start_requests(self):
-        
-        # urls = generate_styleseat_links(self.start_urls[0])
-        # for url in urls:
-        #     page  = generate_html(url)
-        threads = []
-        # with ThreadPoolExecutor(max_workers=10) as executor:
-        #     for url in self.start_urls:
-        #         requests = SeleniumRequest(
-        #             url = url,
-        #             callback = self.parse
-        #         )
-        #         threads.append(
-        #             executor.submit(
-        #                 requests, url, self.parse
-        #             )
-        #         )
+        urls = generate_styleseat_links(f"https://www.styleseat.com/m/search/{self.region}/{self.category}")
 
-        #     for t in as_completed(threads):
-        #         yield t.result()
-                
-        for url in self.start_urls:
+        for url in urls:
+            page  = generate_html(url)
+            
+            print("==================☁️☁️generated_url☁️☁️===========")
+            print(page.current_url)
+            print("==================☁️☁️generated_url☁️☁️===========")
             yield SeleniumRequest(
-                    url = url,
+                    url = page.current_url,
                     callback = self.parse
                 )
-
-    
-
+   
 
     def parse(self, response):
-        # styleseat_item = StyleSeatItem()
+        styleseat_item = APIItem()
         resp_meta = {}
         print("==================☁️☁️meta_driver☁️☁️===========")
         print(response.request.meta)
         print("==================☁️☁️meta_driver☁️☁️===========")
         time.sleep(10)
-        # styleseat_item["name"] = "styleseat"
+        styleseat_item["name"] = "styleseat"
+        styleseat_item["inference_key"] = self.region
         resp_meta["name"] = "styleseat"
-        import pdb;pdb.set_trace()
         resp_meta["secondary_name"] = response.request.meta['driver'].find_element(by=By.XPATH, value='//h1[@data-testid="proName"]').text
         print(f"resp_meta------------------------------->{resp_meta}")
         resp_meta["logo_url"] = response.request.meta['driver'].find_element(by=By.XPATH, value='//div[contains(@class,"avatar-icon")]').get_attribute("style")
@@ -82,8 +72,8 @@ class StyleseatSpider(CrawlSpider):
         resp_meta["businessName"] = response.request.meta['driver'].find_element(by=By.XPATH, value='//div[@data-testid="proBusinessName"]').text
         resp_meta["ratings"] = response.request.meta['driver'].find_element(by=By.XPATH, value='//div[@data-testid="rating-stars"]').text
         # //div[@data-testid="service-card"]
+        time.sleep(7)
         services = []
-        import pdb;pdb.set_trace()
         for i,elem in enumerate(response.request.meta['driver'].find_elements(by=By.XPATH,value='//div[@data-testid="service-card"]')):
             if i < 3:
                 try:
@@ -121,7 +111,6 @@ class StyleseatSpider(CrawlSpider):
         
         reviews = []
         time.sleep(10)
-        import pdb;pdb.set_trace()
         try:
         
             response.request.meta['driver'].find_element(by=By.XPATH, value='//div[@data-testid="tab-navigation-Reviews"]/div').click()
@@ -174,7 +163,6 @@ class StyleseatSpider(CrawlSpider):
 
         if response.url:
             resp_meta["gallery_image_urls"] = [elem.get_attribute("src") for elem in response.request.meta['driver'].find_elements(by=By.TAG_NAME, value='img')]
-        import pdb;pdb.set_trace() 
         time_urls = None
         response.request.meta['driver'].get(response.url)
         time.sleep(10)
@@ -190,55 +178,57 @@ class StyleseatSpider(CrawlSpider):
             print(error)
 
         date_slots = []
-        for url in time_urls[0:1]:
-            time.sleep(7)
-            response.request.meta['driver'].get(url)
-            time.sleep(7)
-            try:
-                import pdb;pdb.set_trace() 
-                for available_date in response.request.meta['driver'].find_elements(by=By.XPATH, value='//div[@data-testid="sunshine-dot"]/../../../div'):
-                    available_date.click()
-                    time.sleep(7)
-                    try:
-                        date_slot = {
-                            "date": available_date.text,
-                            "available":[el.text for el in available_date.find_elements(by=By.XPATH,value='//button[@class="ss-button medium text-light"]') if el.text != "Notify"],
-                            "booked":[el.text for el in available_date.find_elements(by=By.XPATH,value=f'//div[contains(@data-testid,"bookedtimepill")]/div')]
-                        }
-                        date_slots.append(date_slot)
-                    except Exception as error:
-                        print(error)
+        # for url in time_urls[0:1]:
+        #     time.sleep(7)
+        #     response.request.meta['driver'].get(url)
+        #     time.sleep(7)
+        #     try:
+        #         import pdb;pdb.set_trace() 
+        #         for available_date in response.request.meta['driver'].find_elements(by=By.XPATH, value='//div[@data-testid="sunshine-dot"]/../../../div'):
+        #             available_date.click()
+        #             time.sleep(7)
+        #             try:
+        #                 date_slot = {
+        #                     "date": available_date.text,
+        #                     "available":[el.text for el in available_date.find_elements(by=By.XPATH,value='//button[@class="ss-button medium text-light"]') if el.text != "Notify"],
+        #                     "booked":[el.text for el in available_date.find_elements(by=By.XPATH,value=f'//div[contains(@data-testid,"bookedtimepill")]/div')]
+        #                 }
+        #                 date_slots.append(date_slot)
+        #             except Exception as error:
+        #                 print(error)
                         
-                    time.sleep(5)
-                    response.request.meta['driver'].get(url)
-                    time.sleep(7)
+        #             time.sleep(5)
+        #             response.request.meta['driver'].get(url)
+        #             time.sleep(7)
 
 
-            except Exception as error:
-                print(error)
+        #     except Exception as error:
+        #         print(error)
 
-        print("==================☁️☁️date_slots☁️☁️===========")
-        print(date_slots)
-        print("==================☁️☁️date_slots☁️☁️===========")
+        # print("==================☁️☁️date_slots☁️☁️===========")
+        # print(date_slots)
+        # print("==================☁️☁️date_slots☁️☁️===========")
 
-        resp_meta["date_slots"] = date_slots
+        # resp_meta["date_slots"] = date_slots
 
-        averages_one = []
-        try:
-            for date_slot in date_slots:
-                averages_one.append((len(date_slot["booked"])/(len(date_slot["booked"])+len(date_slot["available"])))*100)
+        # averages_one = []
+        # try:
+        #     for date_slot in date_slots:
+        #         averages_one.append((len(date_slot["booked"])/(len(date_slot["booked"])+len(date_slot["available"])))*100)
 
-            average = math.ceil(sum(averages_one)/len(averages_one))
+        #     average = math.ceil(sum(averages_one)/len(averages_one))
 
-            if average > 70:
-                resp_meta["calendar_availability"] = "Fully Booked Calendar"
-            elif average > 34 and average < 70:
-                resp_meta["calendar_availability"] = "Some Calendar Availability"
-            elif average < 34:
-                resp_meta["calendar_availability"] = "Empty Calendar"
-        except Exception as error:
-            print(error)
-        # styleseat_item["resp_meta"] = resp_meta
+        #     if average > 70:
+        #         resp_meta["calendar_availability"] = "Fully Booked Calendar"
+        #     elif average > 34 and average < 70:
+        #         resp_meta["calendar_availability"] = "Some Calendar Availability"
+        #     elif average < 34:
+        #         resp_meta["calendar_availability"] = "Empty Calendar"
+        # except Exception as error:
+        #     print(error)
+        
+        styleseat_item["response"] = resp_meta
+
         yield resp_meta
         
 

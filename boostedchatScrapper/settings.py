@@ -9,6 +9,8 @@
 
 from shutil import which
 import os
+from django.core.wsgi import get_wsgi_application
+from django import setup
 
 BOT_NAME = "boostedchatScrapper"
 
@@ -57,6 +59,7 @@ DOWNLOADER_MIDDLEWARES = {
    'scrapeops_scrapy.middleware.retry.RetryMiddleware': 550,
    'scrapy.downloadermiddlewares.retry.RetryMiddleware': None,
    "boostedchatScrapper.middlewares.SeleniumMiddleware": 800,
+   # 'scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware': 1
 }
 
 # Enable or disable extensions
@@ -101,3 +104,8 @@ FEED_EXPORT_ENCODING = "utf-8"
 
 SELENIUM_DRIVER_NAME = 'chrome'
 SELENIUM_DRIVER_ARGUMENTS=['-headless','--lang=en']  # '--headless' if using chrome instead of firefox
+
+
+DJANGO_SETTINGS_MODULE = os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'api.settings')
+application = get_wsgi_application()
+setup()

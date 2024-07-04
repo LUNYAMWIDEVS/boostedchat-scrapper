@@ -1,23 +1,63 @@
 import yaml
 import os
+import json
+import logging
+import requests
 import pandas as pd
+import subprocess
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
 from rest_framework import status
 from django.conf import settings
 from django.shortcuts import get_object_or_404
-from .tasks import scrap_followers_or_similar_accounts,scrap_followers_into_csv,scrap_followers_or_similar_accounts_forever
-from boostedchatScrapper.spiders.instagram import InstagramSpider
-from boostedchatScrapper.spiders.helpers.instagram_login_helper import login_user
+from .tasks import scrap_followers,scrap_info,scrap_users,insert_and_enrich,scrap_mbo
 from api.helpers.dag_generator import generate_dag
 from api.helpers.date_helper import datetime_to_cron_expression
-# Create your views here.
-# views.py
+from boostedchatScrapper.spiders.helpers.thecut_scrapper import scrap_the_cut
+from boostedchatScrapper.spiders.helpers.instagram_helper import fetch_pending_inbox,approve_inbox_requests,send_direct_answer
+from django.db.models import Q
+
+from .models import InstagramUser
 
 from rest_framework import viewsets
-from .models import Score, QualificationAlgorithm, Scheduler, LeadSource
-from .serializers import ScoreSerializer, QualificationAlgorithmSerializer, SchedulerSerializer, LeadSourceSerializer, SetupScrapperSerializer
+from boostedchatScrapper.models import ScrappedData
+
+from .models import Score, QualificationAlgorithm, Scheduler, InstagramUser, LeadSource,DagModel,SimpleHttpOperatorModel,WorkflowModel
+from .serializers import ScoreSerializer, InstagramLeadSerializer,  QualificationAlgorithmSerializer, SchedulerSerializer, LeadSourceSerializer, SimpleHttpOperatorModelSerializer, WorkflowModelSerializer
+
+class PaginationClass(PageNumberPagination):
+    page_size = 20  # Set the number of items per page
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+
+class InstagramLeadViewSet(viewsets.ModelViewSet):
+    queryset = InstagramUser.objects.all()
+    serializer_class = InstagramLeadSerializer
+    pagination_class = PaginationClass
+
+    @action(detail=False,methods=['post'],url_path='qualify-account')
+    def qualify_account(self, request, pk=None):
+        accounts = InstagramUser.objects.filter(username = request.data.get('username'))
+        accounts_qualified = []
+        if accounts.exists():
+            for account in accounts:
+                if account.info:
+                    account.qualified = request.data.get('qualify_flag')
+                    account.save()
+                    accounts_qualified.append(
+                        {
+                            "qualified":account.qualified,
+                            "account_id":account.id
+                        }
+                    )
+                else:
+                    return Response({"message":"user has not outsourced information"})
+        
+        return Response(accounts_qualified, status=status.HTTP_200_OK)
 
 class ScoreViewSet(viewsets.ModelViewSet):
     queryset = Score.objects.all()
@@ -36,122 +76,369 @@ class LeadSourceViewSet(viewsets.ModelViewSet):
     serializer_class = LeadSourceSerializer
 
 
-class CleanDatabaseLeads(APIView):
+class SimpleHttpOperatorViewSet(viewsets.ModelViewSet):
+    queryset = SimpleHttpOperatorModel.objects.all()
+    serializer_class = SimpleHttpOperatorModelSerializer
+
+
+
+class WorkflowViewSet(viewsets.ModelViewSet):
+    queryset = WorkflowModel.objects.all()
+    serializer_class = WorkflowModelSerializer
+    pagination_class = PaginationClass
+
+    
+class ScrapFollowers(APIView):
     def post(self, request):
-        followers = request.data.get("get_followers")
-        positive_keywords = request.data.get("positive_keywords")
-        negative_keywords = request.data.get("negative_keywords")
-        scrap_followers_or_similar_accounts_forever.delay(followers,positive_keywords,negative_keywords)
+        username = request.data.get("username")
+        delay = int(request.data.get("delay"))
+        round_ =  int(request.data.get("round"))
+        chain = request.data.get("chain")
+        if isinstance(username,list):
+            for account in username:
+                if chain:
+                    scrap_followers(account,delay,round_=round_)
+                else:
+                    scrap_followers.delay(account,delay,round_=round_)
+        else:
+            scrap_followers.delay(username,delay,round_=round_)
         return Response({"success":True},status=status.HTTP_200_OK)
 
-class ExtractInfiniteLeads(APIView):
+class ScrapTheCut(APIView):
+
     def post(self,request):
-        scrap_followers_or_similar_accounts_forever.delay()
-        return Response({"success":True},status=status.HTTP_200_OK)
-
-class GetFollowersOrSimilarAccounts(APIView):
-    def post(self,request):
-        accounts = request.data.get("accounts",[])
-        followers = request.data.get("get_followers")
-        positive_keywords = request.data.get("positive_keywords")
-        negative_keywords = request.data.get("negative_keywords")
-        scrap_followers_or_similar_accounts.delay(accounts,followers,positive_keywords,negative_keywords)
-        return Response({"success":True},status=status.HTTP_200_OK)
-
-
-
-class GetFollowersToCSV(APIView):
-    def post(self, request):
-        client = login_user(username='matisti96', password='luther1996-')
-        username = request.data.get('accounts')
-        user_id = client.user_id_from_username(''.join(username))
-        _, cursor = client.user_followers_gql_chunk(user_id, max_amount=3)
-        
-        scrap_followers_into_csv.delay(cursor,user_id)
-        return Response({"success":True},status=status.HTTP_200_OK)
-
-
-class SetupScrapper(APIView):
-    def post(self, request):
-        
+        chain = request.data.get("chain")
+        round_ = request.data.get("round")
+        index = request.data.get("index")
+        record = request.data.get("record", None)
+        refresh = request.data.get("refresh", False)
+        number_of_leads = request.data.get("number_of_leads",0)
         try:
-            request.data
-        except Exception as error:
-            return Response({'error': str(error)}, status=400)
-        serializer = SetupScrapperSerializer(data=request.data)
-        if serializer.is_valid():
-            data_dict = serializer.data
-            try:
-                qualification_algorithm = get_object_or_404(QualificationAlgorithm, id = data_dict.get('qualification_algorithm'))
-            except QualificationAlgorithm.DoesNotExist as error:
-                return Response({'error': str(error)}, status=400)
-            try:
-                schedule = get_object_or_404(Scheduler, id = data_dict.get('schedule'))
-            except QualificationAlgorithm.DoesNotExist as error:
-                return Response({'error': str(error)}, status=400)
+            users = None
+            if refresh:
+                scrap_the_cut(round_number=round_)
+            if refresh and record:
+                scrap_the_cut(round_number=round_,record=record)
+            if not record:
+                users = ScrappedData.objects.filter(round_number=round_)[index:index+number_of_leads]
+            else:
+                users = ScrappedData.objects.filter(round_number=round_)
 
-            try:
-                sources = LeadSource.objects.filter(id__in = data_dict.get('source'))
-            except LeadSource.DoesNotExist as error:
-                return Response({'error': str(error)}, status=400)
-            try:
-                collect_as_csv = data_dict.get('collect_as_csv')
-            except Exception as error:
-                return Response({'error': str(error)}, status=400)
-            try:
-                make_infinite = data_dict.get('make_infinite')
-            except Exception as error:
-                return Response({'error': str(error)}, status=400)
-            # Create a dictionary from the serializer data
-            print(data_dict)
-            data = None
-            for source in sources:
-                if source.criterion == 0 or source.criterion == 1 and not make_infinite:
-                    data = {
-                        "dag_id": source.name,
-                        "schedule_interval": datetime_to_cron_expression(schedule.scrapper_starttime),
-                        "endpoint": "instagram/scrapFollowersOrSimilarAccounts/",
-                        "info":{
-                            "accounts": source.account_usernames,
-                            "get_followers": source.criterion,
-                            "positive_keywords": qualification_algorithm.positive_keywords,
-                            "negative_keywords": qualification_algorithm.negative_keywords
-                        }
-                    }
-                if collect_as_csv:
-                    data = {
-                        "dag_id": source.name,
-                        "schedule_interval": datetime_to_cron_expression(schedule.scrapper_starttime),
-                        "endpoint": "instagram/scrapFollowersToCSV/",
-                        "info":{
-                            "accounts": source.account_usernames,
-                            "get_followers": source.criterion 
-                        }
-                    }
-                if source.criterion == 0 or source.criterion == 1 and make_infinite:
-                    data = {
-                        "dag_id": source.name,
-                        "schedule_interval": datetime_to_cron_expression(schedule.scrapper_starttime),
-                        "endpoint": "instagram/scrapForever/",
-                        "info":{
-                            "get_followers": source.criterion,
-                            "positive_keywords": qualification_algorithm.positive_keywords,
-                            "negative_keywords": qualification_algorithm.negative_keywords
-                        }
-                    }
-                
-            # Write the dictionary to a YAML file
-            yaml_file_path = os.path.join(settings.BASE_DIR, 'api','helpers',
-                            'include','dag_configs', f"{source.name}_config.yaml")
-            with open(yaml_file_path, 'w') as yaml_file:
-                try:
-                    yaml.dump(data, yaml_file, default_flow_style=False)
-                except Exception as error:
-                    return Response({'error': str(error)}, status=400)
+            if users.exists():
+                if chain:
+                    for user in users:
+                        scrap_users(list(user.response.get("keywords")[1]),round_ = round_,index=index)
+                else:
+                    for user in users:
+                        scrap_users.delay(list(user.response.get("keywords")[1]),round_ = round_,index=index)
 
-            try:
-                generate_dag()
-            except Exception as error:
-                return Response({'error': str(error)}, status=400)
-            return Response({'status': 'success', 'message': 'DAG config created and YAML file saved'}, status=status.HTTP_201_CREATED)
-        return Response({'error': 'Invalid input data'}, status=400)
+                return Response({"success": True}, status=status.HTTP_200_OK)
+            else:
+                logging.warning("Unable to find user")
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class ScrapStyleseat(APIView):
+
+    def post(self,request):
+        region = request.data.get("region")
+        category = request.data.get("category")
+        chain = request.data.get("chain")
+        round_ = request.data.get("round")
+        index = request.data.get("index")
+        try:
+            subprocess.run(["scrapy", "crawl", "styleseat","-a",f"region={region}","-a",f"category={category}"])
+            users = ScrappedData.objects.filter(inference_key=region)
+            if users.exists():
+                if chain:
+                    for user in users:
+                        scrap_users(list(user.response.get("businessName")),round_ = round_,index=index)
+                else:
+                    for user in users:
+                        scrap_users.delay(list(user.response.get("businessName")),round_ = round_,index=index)
+
+                return Response({"success": True}, status=status.HTTP_200_OK)
+            else:
+                logging.warning("Unable to find user")
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class ScrapGmaps(APIView):
+
+    def post(self,request):
+        search_string = request.data.get("search_string")
+        chain = request.data.get("chain")
+        round_ = request.data.get("round")
+        index = request.data.get("index")
+        try:
+            subprocess.run(["scrapy", "crawl", "gmaps","-a",f"search_string={search_string}"])
+            users = ScrappedData.objects.filter(inference_key=search_string)
+            if users.exists():
+                if chain:
+                    for user in users:
+                        scrap_users(list(user.response.get("business_name")),round_ = round_,index=index)
+                else:
+                    for user in users:
+                        scrap_users.delay(list(user.response.get("business_name")),round_ = round_,index=index)
+
+                return Response({"success": True}, status=status.HTTP_200_OK)
+            else:
+                logging.warning("Unable to find user")
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+
+class ScrapAPI(APIView):
+
+    def get(self,request):
+        try:
+            # Execute Scrapy spider using the command line
+            subprocess.run(["scrapy", "crawl", "api"])
+            return Response({"success": True}, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+
+
+class ScrapSitemaps(APIView):
+
+    def get(self,request):
+        try:
+            # Execute Scrapy spider using the command line
+            subprocess.run(["scrapy", "crawl", "sitemaps"])
+            return Response({"success": True}, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+
+class ScrapMindBodyOnline(APIView):
+
+    def post(self,request):
+        chain = request.data.get("chain")
+        try:
+            if chain:
+                scrap_mbo()
+            else:    
+                # Execute Scrapy spider using the command line
+                scrap_mbo.delay()
+            return Response({"success": True}, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class ScrapURL(APIView):
+
+    def get(self,request):
+        try:
+            # Execute Scrapy spider using the command line
+            subprocess.run(["scrapy", "crawl", "webcrawler"])
+            return Response({"success": True}, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+
+class ScrapUsers(APIView):
+    def post(self,request):
+        query = request.data.get("query")
+        round_ = int(request.data.get("round"))
+        index = int(request.data.get("index"))
+        chain = request.data.get("chain")
+
+        if isinstance(query,list):
+            if chain:
+                scrap_users(query,round_ = round_,index=index)
+            else:
+                scrap_users.delay(query,round_ = round_,index=index)
+            
+        return Response({"success":True},status=status.HTTP_200_OK)
+
+class ScrapInfo(APIView):
+    def post(self,request):
+        delay_before_requests = int(request.data.get("delay_before_requests"))
+        delay_after_requests = int(request.data.get("delay_after_requests"))
+        step = int(request.data.get("step"))
+        accounts = int(request.data.get("accounts"))
+        round_number = int(request.data.get("round"))
+        chain = request.data.get("chain")
+        if chain:
+            scrap_info(delay_before_requests,delay_after_requests,step,accounts,round_number)
+        else:
+            scrap_info.delay(delay_before_requests,delay_after_requests,step,accounts,round_number)
+        return Response({"success":True},status=status.HTTP_200_OK)
+    
+
+
+
+class InsertAndEnrich(APIView):
+    def post(self,request):
+        keywords_to_check = request.data.get("keywords_to_check")
+        round_ = request.data.get("round")
+        chain = request.data.get("chain")
+        if chain:
+            insert_and_enrich(keywords_to_check,round_)
+        else:
+            insert_and_enrich.delay(keywords_to_check,round_)
+        return Response({"success":True},status=status.HTTP_200_OK)
+    
+
+class GetMediaIds(APIView):
+    def post(self,request):
+        round_ = request.data.get("round")
+        chain = request.data.get("chain")
+        
+        datasets = []
+        for user in InstagramUser.objects.filter(Q(round=round_) & Q(qualified=True)):
+            resp = requests.post(f"https://api.{os.environ.get('DOMAIN1', '')}.boostedchat.com/v1/instagram/has-client-responded/",data={"username":user.username})
+            print(resp.status_code)
+            if resp.status_code == 200:
+                if resp.json()['has_responded']:
+                    return Response({"message":"No need to carry on further because client has responded"}, status=status.HTTP_200_OK)
+            else:
+                resp = requests.get(f"https://api.{os.environ.get('DOMAIN1', '')}.boostedchat.com/v1/instagram/account/retrieve-salesrep/{user.username}/")
+                if resp.status_code == 200:
+                    print(resp.json())
+                    dataset = {
+                        "mediaIds": user.info.get("media_id"),
+                        "username_from": resp.json()['salesrep'].get('username','')
+                    }
+                    datasets.append(dataset)
+            
+
+        if chain and round_:  
+            return Response({"data": datasets},status=status.HTTP_200_OK)
+        else:
+            return Response({"error":"There is an error fetching medias"}, status=400)
+        
+
+class GetMediaComments(APIView):
+    def post(self,request):
+        round_ = request.data.get("round")
+        chain = request.data.get("chain")
+        
+        datasets = []
+        for user in InstagramUser.objects.filter(Q(round=round_) & Q(qualified=True)):
+            resp = requests.post(f"https://api.{os.environ.get('DOMAIN1', '')}.boostedchat.com/v1/instagram/has-client-responded/",data={"username":user.username})
+            print(resp.status_code)
+            if resp.status_code == 200:
+                if resp.json()['has_responded']:
+                    return Response({"message":"No need to carry on further because client has responded"}, status=status.HTTP_200_OK)
+            else:
+                resp = requests.get(f"https://api.{os.environ.get('DOMAIN1', '')}.boostedchat.com/v1/instagram/account/retrieve-salesrep/{user.username}/")
+                if resp.status_code == 200:
+                    print(resp.json())
+                    dataset = {
+                        "mediaId": user.info.get("media_id"),
+                        "comment": user.info.get("media_comment"),
+                        "username_from": resp.json()['salesrep'].get('username','')
+                    }
+                    datasets.append(dataset)
+
+        
+        
+        if chain and round_:  
+            return Response({"data": datasets},status=status.HTTP_200_OK)
+        else:
+            return Response({"error":"There is an error fetching medias"}, status=400)
+        
+class GetAccounts(APIView):
+    def post(self,request):
+        round_ = request.data.get("round")
+        chain = request.data.get("chain")
+        
+        datasets = []
+        for user in InstagramUser.objects.filter(Q(round=round_) & Q(qualified=True)):
+            resp = requests.post(f"https://api.{os.environ.get('DOMAIN1', '')}.boostedchat.com/v1/instagram/has-client-responded/",data={"username":user.username})
+            print(resp.status_code)
+            if resp.status_code == 200:
+                if resp.json()['has_responded']:
+                    return Response({"message":"No need to carry on further because client has responded"}, status=status.HTTP_200_OK)
+            else:
+                resp = requests.get(f"https://api.{os.environ.get('DOMAIN1', '')}.boostedchat.com/v1/instagram/account/retrieve-salesrep/{user.username}/")
+                if resp.status_code == 200:
+                    print(resp.json())
+                    dataset = {
+                        "mediaId": user.info.get("media_id"),
+                        "comment": user.info.get("media_comment"),
+                        "usernames_to": user.info.get("username"),
+                        "username": user.info.get("username"),
+                        "username_from": resp.json()['salesrep'].get('username','')
+                    }
+                    datasets.append(dataset)
+        
+        
+        if chain and round_:  
+            return Response({"data": datasets},status=status.HTTP_200_OK)
+        else:
+            return Response({"error":"There is an error fetching medias"}, status=400)
+        
+
+
+class FetchPendingInbox(APIView):
+    def post(self, request):
+        inbox_dataset = fetch_pending_inbox(session_id=request.data.get("session_id"))
+        return Response({"data":inbox_dataset},status=status.HTTP_200_OK)
+    
+class ApproveRequest(APIView):
+    def post(self, request):
+        approved_datasets = approve_inbox_requests(session_id=request.data.get("session_id"))
+        return Response({"data":approved_datasets},status=status.HTTP_200_OK)
+
+class SendDirectAnswer(APIView):
+    def post(self, request):
+        send_direct_answer(session_id=request.data.get("session_id"),
+                           thread_id=request.data.get("thread_id"),
+                           message=request.data.get("message"))
+        return Response({"success":True},status=status.HTTP_200_OK)
+    
+
+class PayloadQualifyingAgent(APIView):
+    def post(self, request):
+        round_ = request.data.get("round",1209)
+        scrapped_users = InstagramUser.objects.filter(round=round_)
+        payloads = []
+        for user in scrapped_users:
+            payload = {
+                "department":"Qualifying Department",
+                "Scraped":{
+                    "username":user.username,
+                    "relevant_information":{
+                        "dummy":"dummy"
+                    },
+                    "Relevant Information":{
+                        "dummy":"dummy"
+                    },
+                    "outsourced_info":user.info
+                }
+            }
+            payloads.append(payload)
+        return Response({"data":payloads}, status=status.HTTP_200_OK)
+
+
+class PayloadAssignmentAgent(APIView):
+    def post(self, request):
+        "this payload helps"
+        round_ = request.data.get("round",1209)
+        qualified_users = InstagramUser.objects.filter(Q(round=round_) & Q(qualified=True))
+        payloads = []
+        for user in qualified_users:
+            payload =  {
+                "department":"Assignment Department",
+                "Qualified":{
+                    "username":user.username,
+                    "salesrep_capacity":2,
+                    "Influencer":"",
+                    "outsourced_information":user.info,
+                    "relevant_Information":{
+                        "dummy":"dummy"
+                    },
+                    "Relevant Information":{
+                        "dummy":"dummy"
+                    },
+                    "relevant_information":user.info
+                }
+            }
+            payloads.append(payload)
+        return Response({"data":payloads}, status=status.HTTP_200_OK)
+
+
